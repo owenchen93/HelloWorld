@@ -1,0 +1,126 @@
+Title         : Databus流程说明
+Author        : dtdream
+Logo          : True
+
+[TITLE]
+
+# Databus流程说明
+
+## 目的
+
+将外部系统(Beaver)传输的日志数据导入hive中。
+
+## 服务端部署流程
+
+### 环境部署
+
+* 修改配置
+	1. 配置confluent.properties文件（启动kafka、kafka connect、schema registry和REST API模块配置文件）： 
+		* broker.id对于集群上的每一个kafka borker都要求是唯一的
+		* listeners、port、bootstrap.servers都指向的是本地配置的kafka的地址或端口
+		* advertised.host.name表示本机的外部ip
+		* schema.registry.url指向本机提供的schema registry服务地址
+		* zookeeper.connect配置了连接的zookeeper地址(注：不要加http:\\)
+		* key.converter.schema.registry.url和value.converter.schema.registry.url指向本机提供的schema registry服务地址
+		* kafkastore.connection.url配置了连接的zookeeper地址，log.level配置了输出日志等级。
+	
+		```
+		broker.id=0
+		listeners=PLAINTEXT://:9092
+		port=9092
+		host.name=localhost
+		advertised.host.name=192.168.103.47
+		id=kafka-rest-test-server
+		schema.registry.url=http://localhost:8081
+		zookeeper.connect=192.168.103.47:2181
+		bootstrap.servers=localhost:9092
+		group.id=connect-cluster
+		key.converter.schema.registry.url=http://localhost:8081
+		value.converter.schema.registry.url=http://localhost:8081
+		kafkastore.connection.url=192.168.103.47:2181
+		log.level=WARN
+		```
+
+	2. databus.properties文件（创建和注册流程所需配置文件）：
+		* ZOOKEEPER配置了连接的zookeeper地址(注：不要加http:\\)
+		* THRIFT_SERVER为hive的thrift服务地址（可参见下面的配置）
+		* KAFKA_CONNECT指向本机的kafka connect服务地址
+		* KAFKA_SCHEMA指向本机提供的schema registry服务地址
+		* BEELINE_CMD指向本机安装的beeline命令安装地址。
+		
+		```
+		ZOOKEEPER=192.168.103.47:2181
+		THRIFT_SERVER=jdbc:hive2://192.168.103.44:10011
+		KAFKA_CONNECT=http://localhost:8083
+		KAFKA_SCHEMA=httP://localhost:8081
+		BEELINE_CMD=/home/dtdream/spark-1.6.1-bin-dtDun/bin/beeline
+		```
+
+	3. databus-connector.json文件：
+		* hdfs.url配置了连接的hdfs的路径
+		* hadoop.conf.dir配置了hadoop相关配置目录
+		* hadoop.home配置了hadoop安装的根路径
+	 
+
+* 启动模块
+
+	1. bin/install.sh stop 终止当前运行的databus相关进程
+
+	2. bin/install.sh start 根据以上配置启动kafka、kafka connect、schema registry和REST API四个服务 	
+
+### 服务端创建入口
+
+bin/table_control table_name interval(hour)
+执行table_control脚本，第一个参数为表名（假设为t1），第二个参数为间隔的小时数假设为12个小时
+
+### 执行流程
+（在执行之前会先根据分区文件来判断该topic是否已经存在，若已经存在则不会再执行以下的创建流程，若不存在则在分区文件中增加该topic名称。同时执行之前还会删除昨天创建的topic和kafka connector）
+
+1. 创建hive外部表
+	
+	根据表名和表结构创建外部表，创建分区（分区名与间隔时间相关），指定parquet文件的存放路径为：hdfs://ns1/topics/$KAFKA_TOPIC_NAME/partition=0'，其中，$KAFKA_TOPIC_NAME为表名+分区名（以下的topic名称都是表名+分区名）
+
+2. 创建kafka topic
+	
+	在Kafka集群上创建一个topic（表名+分区名）
+
+3. 注册schema结构
+	
+	调用REST api注册Schema：
+	
+	``
+	curl -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" --data @$CONFIG_DIR/schema.json $KAFKA_SCHEMA/subjects/$KAFKA_TOPIC_NAME-value/versions >> $LOG_FILE
+	``
+
+	根据schema.json定义的格式，设置的SchemaRegistry的地址（默认为localhost:8082）,以及topic名称在SchemaRegistry模块中注册schema结构。
+
+4. 创建kafka connector
+	
+	调用REST api创建 kafka connector：
+
+	``
+	curl -X POST -H "Content-Type: application/json" --data @$CONFIG_DIR/databus-connector.json $KAFKA_CONNECT/connectors >> $LOG_FILE
+	``
+
+	根据databus-connector.json的相关配置（包括connector名字，topic名字，connector类型以及hadoop地址等），以及定义好的kafka connector服务地址（默认为localhost:8083）创建connector。
+
+
+## 客户端使用流程
+
+### 对外接口
+
+databus_client.c中的方法：
+	
+``
+long databus_send(const char *tableName, const char *partition, const void *dataBuf, const char *separator)
+``
+
+表名、分区名与服务端的表名和分区名对应，topic名称=表名+分区名，separator为分隔符(假设为"/")，调用此方法就能将一条日志塞入hive中
+
+### 执行流程
+
+1. 首先根据表名和分区名获取topic
+2. 根据topic可以通过Schema Registry得到schema id，将id/xxx/xxx/xxx形式的一条数据输入Kafka集群
+3. 数据进入Kafka集群后，Kafka通知订阅了此Topic的HDFS Connector，Connector从Kafka获取处理后的日志消息，并从Schema Registry获取根据schema id获取schema结构。并根据结构生成记录，根据topic名称，将记录存储到hdfs对应的parquet文件目标路径:/topics/${topic_name}/partition=0（与创建hive外部表是定义的存储目标路径一致）
+
+[reference manual]: http://research.microsoft.com/en-us/um/people/daan/madoko/doc/reference.html  "Madoko reference manual"
